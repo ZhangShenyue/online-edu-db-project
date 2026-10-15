@@ -1,93 +1,134 @@
 package com.example.edu.test;
 
+import com.example.edu.util.DBUtil;
+import com.example.edu.util.RedisUtil;
+import redis.clients.jedis.Jedis;
+import redis.clients.jedis.params.SetParams; // 新增导入
+
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
-
-import com.example.edu.util.DBUtil;
-import com.example.edu.util.RedisUtil;
+import java.sql.SQLException;
 
 /**
- * Redis缓存优化对照实验
- * 旁路缓存 Cache Aside：优先查询Redis，未命中再查询MySQL视图，回写缓存
+ * Redis缓存性能对比测试
+ * Cache Aside旁路缓存 + Redis互斥锁(Mutex Key)，防止缓存击穿
  */
 public class CacheTest {
-    // 测试用户ID
-    private static final int TEST_USER_ID = 301;
-    // 循环查询次数
-    private static final int QUERY_TIMES = 100;
-    // 缓存过期时间，单位秒
-    private static final int CACHE_EXPIRE = 60;
+
+    // 缓存过期时间 10分钟，单位秒
+    private static final int CACHE_TTL = 10 * 60;
+    // 互斥锁过期时间 5000ms，防止死锁
+    private static final long LOCK_TTL_MS = 5000L;
+    // 重试休眠时间
+    private static final long SLEEP_MS = 50L;
 
     public static void main(String[] args) {
-        System.out.println("========== Redis缓存性能对比测试 ==========\n");
+        Long testUserId = 1000L;
+        int queryTimes = 100;
 
-        // 清空旧缓存，保证第一轮查询回源数据库
-        RedisUtil.del("student:stats:" + TEST_USER_ID);
+        System.out.println("========== Redis缓存性能对比测试 ==========");
 
-        // 1. 直接查询MySQL视图（无缓存）
-        long dbStart = System.currentTimeMillis();
-        for (int i = 0; i < QUERY_TIMES; i++) {
-            queryFromDB(TEST_USER_ID);
+        // 1. 直接查询数据库视图
+        long startDb = System.currentTimeMillis();
+        for (int i = 0; i < queryTimes; i++) {
+            queryStudentStatsFromDB(testUserId);
         }
-        long dbCost = System.currentTimeMillis() - dbStart;
-        System.out.printf("数据库查询%d次，总耗时：%d ms，单次平均：%.2f ms\n\n",
-                QUERY_TIMES, dbCost, dbCost * 1.0 / QUERY_TIMES);
+        long endDb = System.currentTimeMillis();
+        long totalDb = endDb - startDb;
+        double avgDb = (double) totalDb / queryTimes;
+        System.out.printf("数据库查询%d次，总耗时：%d ms，单次平均：%.2f ms%n", queryTimes, totalDb, avgDb);
 
-        // 2. 走Redis旁路缓存查询
-        long cacheStart = System.currentTimeMillis();
-        for (int i = 0; i < QUERY_TIMES; i++) {
-            queryFromCache(TEST_USER_ID);
+        // 2. 先清空对应缓存，再测试带互斥锁的缓存查询
+        try (Jedis jedis = RedisUtil.getJedis()) {
+            String cacheKey = "student:stats:" + testUserId;
+            jedis.del(cacheKey);
         }
-        long cacheCost = System.currentTimeMillis() - cacheStart;
-        System.out.printf("缓存查询%d次，总耗时：%d ms，单次平均：%.2f ms\n\n",
-                QUERY_TIMES, cacheCost, cacheCost * 1.0 / QUERY_TIMES);
 
-        double speedUp = (double) dbCost / cacheCost;
-        System.out.printf("性能提升倍数：%.2f 倍\n", speedUp);
+        long startCache = System.currentTimeMillis();
+        for (int i = 0; i < queryTimes; i++) {
+            getStudentStatsWithMutex(testUserId);
+        }
+        long endCache = System.currentTimeMillis();
+        long totalCache = endCache - startCache;
+        double avgCache = (double) totalCache / queryTimes;
+        double rate = avgDb / avgCache;
+        System.out.printf("缓存查询%d次，总耗时：%d ms，单次平均：%.2f ms%n", queryTimes, totalCache, avgCache);
+        System.out.printf("性能提升倍数：%.2f 倍%n", rate);
 
-        System.out.println("\n==== 实验说明 ====");
-        System.out.println("1. 采用Cache Aside旁路缓存模式");
+        System.out.println("==== 实验说明 ====");
+        System.out.println("1. 采用Cache Aside旁路缓存模式，使用Mutex互斥锁防止缓存击穿");
         System.out.println("2. 缓存设置过期时间，实现最终一致性");
         System.out.println("3. 适用于读多写少的学生统计信息查询场景");
     }
 
     /**
-     * 直接查询数据库视图 v_student_study_stats
+     * Cache Aside + Redis互斥锁(Mutex Key)，防止缓存击穿
+     * @param userId 学生ID
+     * @return 学生统计字符串
      */
-    private static String queryFromDB(int userId) {
-        String res = null;
-        String sql = "SELECT * FROM v_student_study_stats WHERE user_id = ?";
-        try (Connection conn = DBUtil.getConnection();
-             PreparedStatement pstmt = conn.prepareStatement(sql)) {
-            pstmt.setInt(1, userId);
-            ResultSet rs = pstmt.executeQuery();
-            if (rs.next()) {
-                res = rs.getInt("course_count") + ","
-                        + rs.getInt("finished_chapter") + ","
-                        + rs.getDouble("avg_score");
+    public static String getStudentStatsWithMutex(Long userId) {
+        String cacheKey = "student:stats:" + userId;
+        String mutexKey = "mutex:student:stats:" + userId;
+
+        try (Jedis jedis = RedisUtil.getJedis()) {
+            // 1. 查询缓存
+            String cacheValue = jedis.get(cacheKey);
+            if (cacheValue != null) {
+                return cacheValue;
             }
-        } catch (Exception e) {
-            e.printStackTrace();
+
+            // ========== 修复这里！使用SetParams ==========
+            String lockRes = jedis.set(mutexKey, "locked", SetParams.setParams().nx().px(LOCK_TTL_MS));
+
+            if ("OK".equals(lockRes)) {
+                try {
+                    // 获取锁成功，查询数据库
+                    String dbData = queryStudentStatsFromDB(userId);
+                    if (dbData != null) {
+                        jedis.setex(cacheKey, CACHE_TTL, dbData);
+                    }
+                    return dbData;
+                } finally {
+                    // 释放锁
+                    jedis.del(mutexKey);
+                }
+            } else {
+                // 获取锁失败，短暂休眠后重试
+                Thread.sleep(SLEEP_MS);
+                return getStudentStatsWithMutex(userId);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return null;
         }
-        return res;
     }
 
     /**
-     * 旁路缓存逻辑：先查Redis，没有则查数据库并写入缓存
+     * 从MySQL视图 v_student_study_stats 查询学生统计数据
      */
-    private static String queryFromCache(int userId) {
-        String key = "student:stats:" + userId;
-        String value = RedisUtil.get(key);
-        if (value != null) {
-            // 缓存命中，直接返回
-            return value;
+    private static String queryStudentStatsFromDB(Long userId) {
+        Connection conn = null;
+        PreparedStatement pstmt = null;
+        ResultSet rs = null;
+        try {
+            conn = DBUtil.getConnection();
+            String sql = "SELECT * FROM v_student_study_stats WHERE user_id = ?";
+            pstmt = conn.prepareStatement(sql);
+            pstmt.setLong(1, userId);
+            rs = pstmt.executeQuery();
+            if (rs.next()) {
+                return "user_id:" + rs.getLong("user_id")
+                        + ",选课数:" + rs.getLong("course_count")
+                        + ",已完成章节:" + rs.getLong("finished_chapter")
+                        + ",平均分:" + rs.getDouble("avg_score");
+            }
+            return null;
+        } catch (SQLException e) {
+            e.printStackTrace();
+            return null;
+        } finally {
+            DBUtil.close(conn, pstmt, rs);
         }
-        // 缓存未命中，回源MySQL
-        value = queryFromDB(userId);
-        if (value != null) {
-            RedisUtil.setex(key, CACHE_EXPIRE, value);
-        }
-        return value;
     }
 }
